@@ -10,6 +10,7 @@ import { statSync } from 'fs';
 import path from 'path';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { getProjectContext } from '../../utils/project-name.js';
+import { resolveRuntimeContext } from '../../services/hooks/runtime-selector.js';
 
 const FILE_READ_GATE_MIN_BYTES = 1_500;
 
@@ -151,6 +152,20 @@ export const fileContextHandler: EventHandler = {
 
     if (input.cwd && !shouldTrackProject(input.cwd)) {
       logger.debug('HOOK', 'Project excluded from tracking, skipping file context', { cwd: input.cwd });
+      return { continue: true, suppressOutput: true };
+    }
+
+    // Server-runtime deployments have no worker to reach, and unlike
+    // context.ts/session-init.ts/observation.ts/summarize.ts, this handler
+    // has no server-mode equivalent to fall back to: the worker's
+    // `/api/observations/by-file` lookup keys off files_read/files_modified
+    // columns that PostgresObservationRepository (the /v1/* backing store)
+    // doesn't track at all, so there's no REST route to call instead. Degrade
+    // to a silent no-op rather than calling executeWithWorkerFallback below,
+    // which has no worker to find in server mode and would deterministically
+    // hit the worker-unreachable path (recordWorkerUnreachable) on every
+    // single PreToolUse:Read.
+    if (resolveRuntimeContext().runtime === 'server') {
       return { continue: true, suppressOutput: true };
     }
 
