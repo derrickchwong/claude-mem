@@ -260,6 +260,61 @@ describe('ServerClient', () => {
     expect(result.observations).toHaveLength(2);
   });
 
+  it('getObservationsByIds sends POST /v1/memories/batch with projectId and ids', async () => {
+    installFetch(async () => new Response(
+      JSON.stringify({ observations: [{ id: 'o1', projectId: 'p1', content: 'a' }, { id: 'o2', projectId: 'p1', content: 'b' }] }),
+      { status: 200 },
+    ));
+    const client = new ServerClient({ serverBaseUrl: 'http://localhost:9999', apiKey: 'cmem_test' });
+    const result = await client.getObservationsByIds({ projectId: 'p1', ids: ['o1', 'o2'] });
+    expect(captured[0]?.url).toBe('http://localhost:9999/v1/memories/batch');
+    expect(captured[0]?.method).toBe('POST');
+    expect((captured[0]?.body as Record<string, unknown>).projectId).toBe('p1');
+    expect((captured[0]?.body as Record<string, unknown>).ids).toEqual(['o1', 'o2']);
+    expect(result.observations).toHaveLength(2);
+  });
+
+  it('getTimeline sends POST /v1/timeline with anchorId and depth params', async () => {
+    installFetch(async () => new Response(
+      JSON.stringify({
+        anchor: { id: 'o2', projectId: 'p1', content: 'anchor' },
+        before: [{ id: 'o1', projectId: 'p1', content: 'before' }],
+        after: [{ id: 'o3', projectId: 'p1', content: 'after' }],
+      }),
+      { status: 200 },
+    ));
+    const client = new ServerClient({ serverBaseUrl: 'http://localhost:9999', apiKey: 'cmem_test' });
+    const result = await client.getTimeline({
+      projectId: 'p1',
+      anchorId: 'o2',
+      depthBefore: 1,
+      depthAfter: 1,
+      platformSource: 'Codex CLI',
+    });
+    expect(captured[0]?.url).toBe('http://localhost:9999/v1/timeline');
+    const body = captured[0]?.body as Record<string, unknown>;
+    expect(body.anchorId).toBe('o2');
+    expect(body.depthBefore).toBe(1);
+    expect(body.depthAfter).toBe(1);
+    expect(body.platformSource).toBe('codex');
+    expect(body.query).toBeUndefined();
+    expect(result.anchor.id).toBe('o2');
+    expect(result.before[0]?.id).toBe('o1');
+    expect(result.after[0]?.id).toBe('o3');
+  });
+
+  it('getTimeline omits anchorId when only query is given', async () => {
+    installFetch(async () => new Response(
+      JSON.stringify({ anchor: { id: 'o2', projectId: 'p1', content: 'anchor' }, before: [], after: [] }),
+      { status: 200 },
+    ));
+    const client = new ServerClient({ serverBaseUrl: 'http://localhost:9999', apiKey: 'cmem_test' });
+    await client.getTimeline({ projectId: 'p1', query: 'anchor' });
+    const body = captured[0]?.body as Record<string, unknown>;
+    expect(body.query).toBe('anchor');
+    expect(body.anchorId).toBeUndefined();
+  });
+
   it('getJobStatus sends GET /v1/jobs/:id', async () => {
     installFetch(async () => new Response(
       JSON.stringify({ generationJob: { id: 'j1', status: 'queued' } }),

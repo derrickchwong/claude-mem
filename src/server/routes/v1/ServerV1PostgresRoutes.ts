@@ -903,6 +903,49 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       },
     ));
 
+    // Scoped batch fetch by id — backs the legacy worker-mode MCP tool
+    // `get_observations` ("Step 3: fetch full details for filtered IDs") when
+    // CLAUDE_MEM_RUNTIME=server. That tool's ids come from `search`'s own
+    // results, so this intentionally shares no logic with the SQLite worker
+    // path; it is a fresh, project/team-scoped read against the REST core.
+    // Missing ids are silently omitted rather than causing a 404 — callers
+    // pass a filtered id list and any that no longer exist (deleted since
+    // search) shouldn't fail the whole batch.
+    app.post('/v1/memories/batch', readAuth, this.handleCreate(
+      z.object({
+        projectId: z.string().min(1),
+        ids: z.array(z.string().min(1)).min(1).max(200),
+      }),
+      async (req, res, body) => {
+        const teamId = this.requireTeamId(req, res);
+        if (!teamId) return;
+        if (!this.ensureProjectAllowed(req, res, body.projectId)) return;
+        let results;
+        try {
+          const repo = new PostgresObservationRepository(this.options.pool);
+          results = await repo.getByIdsForScope({
+            ids: body.ids,
+            projectId: body.projectId,
+            teamId,
+          });
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          logger.warn('SYSTEM', 'observation.batch_get failed', { requestId: req.requestId ?? null }, err);
+          this.handleDbError(err, res, 'observation.batch_get');
+          return;
+        }
+        await this.auditWrite(req, 'observation.read', null, body.projectId, {
+          mode: 'batch_get',
+          requestedIds: body.ids,
+          resultCount: results.length,
+          observationIds: results.map(o => o.id),
+        });
+        res.status(200).json({
+          observations: results.map(serializeObservation),
+        });
+      },
+    ));
+
     // Phase 8 — full-text search over generated observations using the GIN
     // tsvector index. Results are ranked by ts_rank desc, then updated_at desc.
     // The MCP `observation_search` tool calls this endpoint via HTTP so the
@@ -1016,6 +1059,88 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           observations: results.map(serializeObservation),
           context,
         });
+      },
+    ));
+
+    // Chronological context around an anchor observation — backs the legacy
+    // worker-mode MCP tool `timeline` ("Step 2: get context around results")
+    // when CLAUDE_MEM_RUNTIME=server. Anchor resolution mirrors the tool's
+    // own contract: pass `anchorId` directly, or `query` to have this route
+    // resolve an anchor from the top `/v1/search` hit for that query — kept
+    // here (not in the repository) so the repo stays free of FTS policy.
+    app.post('/v1/timeline', readAuth, this.handleCreate(
+      z.object({
+        projectId: z.string().min(1),
+        // Empty string is treated the same as omitted (matching `/v1/context`'s
+        // established convention for `query` below) — a `.min(1)` check on
+        // the raw field would otherwise fail an explicit `anchorId: ''` even
+        // when a valid `query` is also present, before the object-level
+        // `.refine()` below ever gets a chance to accept it via the query.
+        anchorId: z.string().optional().transform(value => (value && value.trim().length > 0 ? value : undefined)),
+        query: z.string().optional().transform(value => (value && value.trim().length > 0 ? value : undefined)),
+        depthBefore: z.number().int().min(0).max(50).optional(),
+        depthAfter: z.number().int().min(0).max(50).optional(),
+        platformSource: z.string().min(1).nullable().optional(),
+      }).refine(body => body.anchorId || body.query, {
+        message: 'either anchorId or query is required',
+      }),
+      async (req, res, body) => {
+        const teamId = this.requireTeamId(req, res);
+        if (!teamId) return;
+        if (!this.ensureProjectAllowed(req, res, body.projectId)) return;
+        const platformSource = normalizePlatformSourceOrNull(body.platformSource);
+        try {
+          const repo = new PostgresObservationRepository(this.options.pool);
+          let anchorId = body.anchorId ?? null;
+          // When resolved from `query`, `search()` already fetched the full
+          // row — thread it through to `timelineForScope` instead of
+          // discarding everything but the id and having it re-fetch the
+          // identical row by id a moment later.
+          let resolvedAnchor: Awaited<ReturnType<typeof repo.search>>[number] | undefined;
+          if (!anchorId) {
+            const [topHit] = await repo.search({
+              projectId: body.projectId,
+              teamId,
+              query: body.query,
+              limit: 1,
+              platformSource,
+            });
+            if (!topHit) {
+              res.status(404).json({ error: 'not_found', message: 'no observation matched the timeline query' });
+              return;
+            }
+            anchorId = topHit.id;
+            resolvedAnchor = topHit;
+          }
+          const timeline = await repo.timelineForScope({
+            anchorId,
+            anchor: resolvedAnchor,
+            projectId: body.projectId,
+            teamId,
+            depthBefore: body.depthBefore,
+            depthAfter: body.depthAfter,
+            platformSource,
+          });
+          if (!timeline) {
+            res.status(404).json({ error: 'not_found', message: 'anchor observation not found' });
+            return;
+          }
+          await this.auditWrite(req, 'observation.read', null, body.projectId, {
+            mode: 'timeline',
+            anchorId,
+            query: body.query,
+            resultCount: 1 + timeline.before.length + timeline.after.length,
+          });
+          res.status(200).json({
+            anchor: serializeObservation(timeline.anchor),
+            before: timeline.before.map(serializeObservation),
+            after: timeline.after.map(serializeObservation),
+          });
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          logger.warn('SYSTEM', 'observation.timeline failed', { requestId: req.requestId ?? null }, err);
+          this.handleDbError(err, res, 'observation.timeline');
+        }
       },
     ));
 

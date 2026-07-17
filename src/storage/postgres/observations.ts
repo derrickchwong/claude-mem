@@ -131,6 +131,34 @@ export class PostgresObservationRepository {
     return row ? mapObservationRow(row) : null;
   }
 
+  // MCP `get_observations` (Step 3 of the search/timeline/get_observations
+  // workflow) needs a scoped batch fetch by id — the single-row
+  // `getByIdForScope` above would mean one round trip per id. Missing ids
+  // are silently omitted from the result (matching `getByIdForScope`'s
+  // null-on-miss semantics) rather than causing the whole call to fail.
+  //
+  // Results are returned in the SAME ORDER as `input.ids`, not database
+  // order: `WHERE id = ANY(...)` makes no ordering guarantee, but the
+  // caller's id list usually reflects a prior `search`/`timeline` ranking
+  // (Step 1/2 of the same workflow) that callers reasonably expect Step 3
+  // to preserve.
+  async getByIdsForScope(input: {
+    ids: string[];
+    projectId: string;
+    teamId: string;
+  }): Promise<PostgresObservation[]> {
+    if (input.ids.length === 0) return [];
+    const result = await this.client.query<ObservationRow>(
+      'SELECT * FROM observations WHERE id = ANY($1::text[]) AND project_id = $2 AND team_id = $3',
+      [input.ids, input.projectId, input.teamId]
+    );
+    const byId = new Map(result.rows.map(row => [row.id, row]));
+    return input.ids
+      .map(id => byId.get(id))
+      .filter((row): row is ObservationRow => row !== undefined)
+      .map(mapObservationRow);
+  }
+
   async listByProject(input: {
     projectId: string;
     teamId: string;
@@ -202,6 +230,118 @@ export class PostgresObservationRepository {
       [input.projectId, input.teamId, query, input.limit ?? 20, platformSource]
     );
     return result.rows.map(mapObservationRow);
+  }
+
+  // MCP `timeline` (Step 2): chronological context around an anchor
+  // observation. The anchor is resolved by id only — callers that only have
+  // a search query resolve an anchor id via `search()` first (see
+  // mcp-server.ts) so this repository stays free of FTS-vs-anchor-resolution
+  // policy. Depth defaults to 10, matching worker-mode's actual
+  // `SearchManager.timeline()` default (src/services/worker/SearchManager.ts)
+  // — NOT the "default 3" the classic `timeline` tool's own schema
+  // description advertises, which is stale relative to that real behavior.
+  async timelineForScope(input: {
+    anchorId: string;
+    projectId: string;
+    teamId: string;
+    depthBefore?: number;
+    depthAfter?: number;
+    platformSource?: string | null;
+    // Callers that already fetched the anchor row (e.g. the `/v1/timeline`
+    // route resolving it from a `query` via `search()`) can pass it through
+    // here to skip a second, otherwise-identical by-id lookup. Callers that
+    // only have the id (the common case) omit this and it's fetched below.
+    anchor?: PostgresObservation;
+  }): Promise<{ anchor: PostgresObservation; before: PostgresObservation[]; after: PostgresObservation[] } | null> {
+    const anchor = input.anchor ?? await this.getByIdForScope({
+      id: input.anchorId,
+      projectId: input.projectId,
+      teamId: input.teamId
+    });
+    if (!anchor) return null;
+
+    const platformSource = normalizePlatformSourceOrNull(input.platformSource);
+    // Same platformSource semantics as `search()` above: match the
+    // observation's own session, or (when it has no session) an agent_event
+    // source linked to that platform.
+    const platformSourceFilter = `
+          AND (
+            $4::text IS NULL
+            OR server_sessions.platform_source = $4
+            OR (
+              observations.server_session_id IS NULL
+              AND EXISTS (
+                SELECT 1
+                FROM observation_sources
+                INNER JOIN agent_events
+                  ON agent_events.id = observation_sources.agent_event_id
+                  AND agent_events.project_id = observations.project_id
+                  AND agent_events.team_id = observations.team_id
+                WHERE observation_sources.observation_id = observations.id
+                  AND observation_sources.source_type = 'agent_event'
+                  AND agent_events.platform_source = $4
+              )
+            )
+          )
+    `;
+    // `(created_at, id) < / > (anchor's created_at, anchor's id)` is a
+    // strict total order (ids are unique), unlike a bare `created_at`
+    // comparison: observations sharing the anchor's exact timestamp — a real
+    // occurrence, since `processGeneratedResponse` persists every
+    // observation from one generation job inside a single transaction, and
+    // Postgres freezes `now()` for the whole transaction — are still
+    // deterministically placed on one side instead of silently excluded
+    // from both. The anchor's own `created_at` is looked up inline (scoped
+    // by project/team, unlike the equivalent lookup this replaced) rather
+    // than reconstructed from the already-fetched `anchor.createdAtEpoch`:
+    // that field is millisecond-truncated (`Date.getTime()`), and Postgres
+    // `timestamptz` has microsecond precision — round-tripping through the
+    // truncated epoch could make the anchor's own row compare as later than
+    // its real stored value and spuriously satisfy `created_at > anchor`,
+    // pulling the anchor itself into the "after" set.
+    const beforeResult = await this.client.query<ObservationRow>(
+      `
+        SELECT observations.* FROM observations
+        LEFT JOIN server_sessions
+          ON server_sessions.id = observations.server_session_id
+          AND server_sessions.project_id = observations.project_id
+          AND server_sessions.team_id = observations.team_id
+        WHERE observations.project_id = $1 AND observations.team_id = $2
+          AND (observations.created_at, observations.id) < (
+            (SELECT created_at FROM observations WHERE id = $3 AND project_id = $1 AND team_id = $2),
+            $3::text
+          )
+${platformSourceFilter}
+        ORDER BY observations.created_at DESC, observations.id DESC
+        LIMIT $5
+      `,
+      [input.projectId, input.teamId, input.anchorId, platformSource, input.depthBefore ?? 10]
+    );
+    const afterResult = await this.client.query<ObservationRow>(
+      `
+        SELECT observations.* FROM observations
+        LEFT JOIN server_sessions
+          ON server_sessions.id = observations.server_session_id
+          AND server_sessions.project_id = observations.project_id
+          AND server_sessions.team_id = observations.team_id
+        WHERE observations.project_id = $1 AND observations.team_id = $2
+          AND (observations.created_at, observations.id) > (
+            (SELECT created_at FROM observations WHERE id = $3 AND project_id = $1 AND team_id = $2),
+            $3::text
+          )
+${platformSourceFilter}
+        ORDER BY observations.created_at ASC, observations.id ASC
+        LIMIT $5
+      `,
+      [input.projectId, input.teamId, input.anchorId, platformSource, input.depthAfter ?? 10]
+    );
+
+    return {
+      anchor,
+      // Chronological order (oldest first), matching worker-mode's timeline shape.
+      before: beforeResult.rows.map(mapObservationRow).reverse(),
+      after: afterResult.rows.map(mapObservationRow)
+    };
   }
 }
 
