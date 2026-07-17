@@ -30,6 +30,8 @@ import {
   type ServerContextObservationsRequest,
   type ServerRecordEventRequest,
   type ServerSearchObservationsRequest,
+  type ServerGetObservationsByIdsRequest,
+  type ServerTimelineRequest,
 } from '../services/hooks/server-client.js';
 import {
   selectRuntime,
@@ -339,6 +341,232 @@ const handleObservationContext = wrapHandler('observation_context', async (args:
   return formatJsonResult(response);
 });
 
+// The three legacy worker-mode tools below (`search`, `timeline`,
+// `get_observations`) predate the server runtime and were never rewired to
+// it: they always called the local per-container worker over HTTP
+// (`callWorker`), which `main()` deliberately never starts when
+// CLAUDE_MEM_RUNTIME=server (see the `selectRuntime() === 'server'` check
+// further down) — so every call failed with "Worker not available" in that
+// mode, with no code path ever reaching the shared server. These wrappers
+// route to the server runtime's REST core (via `ServerClient`) when active,
+// and fall through to the original `callWorker` behavior unchanged when it
+// isn't — worker-mode installs keep working exactly as before.
+
+interface SearchArgs {
+  query?: string;
+  limit?: number;
+  project?: string;
+  platformSource?: string | null;
+  type?: string;
+  obs_type?: string;
+  dateStart?: string;
+  dateEnd?: string;
+  offset?: number;
+  orderBy?: string;
+}
+
+// Allowlist, not denylist: any key on the classic `search` tool's schema
+// that isn't explicitly recognized here gets rejected by default (fail
+// safe) instead of silently passing through unvalidated. A denylist has to
+// be remembered and updated every time the schema grows; an allowlist
+// doesn't — a future filter added to the schema without a matching entry
+// here is rejected automatically instead of quietly being ignored, which is
+// exactly the "filtered search looks like it worked but wasn't" failure
+// this function exists to prevent. `project` is handled separately (its own
+// dedicated error via `rejectServerModeProjectFilter`, called first) so it's
+// listed here only to avoid double-flagging it.
+const SEARCH_SERVER_MODE_HANDLED_KEYS = new Set(['query', 'limit', 'platformSource', 'project']);
+
+function findUnsupportedServerSearchFilter(args: SearchArgs): string | null {
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined) continue;
+    if (SEARCH_SERVER_MODE_HANDLED_KEYS.has(key)) continue;
+    // These two carve-outs forward their own no-op default value through
+    // rather than being rejected outright: `offset: 0` and `type:
+    // 'observations'` request nothing different than omitting the key.
+    if (key === 'type' && value === 'observations') continue;
+    if (key === 'offset' && value === 0) continue;
+    return key;
+  }
+  return null;
+}
+
+// `project` on the classic search/timeline/get_observations tools is a
+// worker-mode concept: a human-readable label (e.g. `basename(cwd)`) used to
+// filter a shared local store. It has no server-mode equivalent — server
+// runtime isolation comes entirely from the API key's own bound project
+// (`resolution.projectId`), and there is no name→id lookup to resolve a
+// `project` string against. Treating it as a `projectId` override (as an
+// earlier version of this fix did) silently misinterprets a name as an id:
+// a team-scoped key would match zero rows (empty results, no error) and a
+// project-scoped key would 403 for any value other than its own id. Reject
+// it explicitly instead, same "no silent wrong" principle as
+// `findUnsupportedServerSearchFilter` above.
+function rejectServerModeProjectFilter(toolName: string, args: { project?: string }): void {
+  if (args.project === undefined || args.project.trim().length === 0) return;
+  throw new Error(
+    `${toolName}: "project" (a worker-mode project-name filter) is not supported when CLAUDE_MEM_RUNTIME=server — this tool is already scoped to the connected project; omit "project" to search it.`
+  );
+}
+
+// Shared entry point for the legacy worker-mode tool family (`search`,
+// `timeline`, `get_observations`, and any future addition to it): resolves
+// the active runtime once, dispatches to whichever implementation applies,
+// and rejects the worker-mode-only `project` filter in server mode. Before
+// this, each tool's handler copy-pasted this same resolve/fallback/reject
+// block independently, alongside a 4th pre-existing pattern
+// (`requireServerForObservationTool`, throw-only, no worker fallback) used
+// by the `observation_*` tools — three different precedents in one file
+// with nothing enforcing which a future 5th tool should copy. This is now
+// the one to copy for any further legacy tool wired to server-mode.
+async function runLegacyMemoryTool<Args extends { project?: string }, T>(
+  toolName: string,
+  args: Args,
+  handlers: {
+    workerMode: () => Promise<T>;
+    serverMode: (resolution: ServerAvailable) => Promise<T>;
+  },
+): Promise<T> {
+  const resolution = resolveServerToolContext();
+  if (!resolution) {
+    return handlers.workerMode();
+  }
+  if (!resolution.available) {
+    throw new ServerClientError('missing_api_key', `${toolName}: ${resolution.reason}`);
+  }
+  rejectServerModeProjectFilter(toolName, args);
+  return handlers.serverMode(resolution);
+}
+
+const handleSearch = wrapHandler('search', async (args: SearchArgs) =>
+  runLegacyMemoryTool('search', args, {
+    workerMode: () => callWorker('/api/search', { query: args }),
+    serverMode: async (resolution) => {
+      const unsupportedFilter = findUnsupportedServerSearchFilter(args);
+      if (unsupportedFilter) {
+        throw new Error(
+          `search: "${unsupportedFilter}" is not supported when CLAUDE_MEM_RUNTIME=server — retry without it (query, limit, and platformSource are the only filters the server runtime honors).`
+        );
+      }
+      const projectId = resolution.projectId;
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+      const platformSource = normalizeMcpPlatformSource(args.platformSource ?? null);
+      // The server's `/v1/search` requires a non-empty query; a query-less
+      // "browse what's recent" call (which worker-mode's SQLite search
+      // allowed) has no server equivalent tool of its own, so it reuses
+      // `/v1/context` (recency-ordered when `query` is omitted) rather than
+      // erroring.
+      const response = query.length > 0
+        ? await resolution.client.searchObservations({ projectId, query, limit: args.limit, platformSource } satisfies ServerSearchObservationsRequest)
+        : await resolution.client.contextObservations({ projectId, limit: args.limit, platformSource });
+      return formatJsonResult(response);
+    },
+  })
+);
+
+interface TimelineArgs {
+  anchor?: number | string;
+  query?: string;
+  depth_before?: number;
+  depth_after?: number;
+  project?: string;
+  platformSource?: string | null;
+}
+
+const handleTimeline = wrapHandler('timeline', async (args: TimelineArgs) =>
+  runLegacyMemoryTool('timeline', args, {
+    workerMode: () => callWorker('/api/timeline', { query: args }),
+    serverMode: async (resolution) => {
+      const projectId = resolution.projectId;
+      const anchorId = args.anchor !== undefined && args.anchor !== null && String(args.anchor).trim().length > 0
+        ? String(args.anchor).trim()
+        : undefined;
+      const query = typeof args.query === 'string' && args.query.trim().length > 0 ? args.query.trim() : undefined;
+      if (!anchorId && !query) {
+        throw new Error('timeline: "anchor" or "query" is required');
+      }
+      const request: ServerTimelineRequest = {
+        projectId,
+        ...(anchorId ? { anchorId } : {}),
+        ...(query ? { query } : {}),
+        ...(args.depth_before !== undefined ? { depthBefore: args.depth_before } : {}),
+        ...(args.depth_after !== undefined ? { depthAfter: args.depth_after } : {}),
+        ...(args.platformSource !== undefined ? { platformSource: normalizeMcpPlatformSource(args.platformSource) } : {}),
+      };
+      const response = await resolution.client.getTimeline(request);
+      return formatJsonResult(response);
+    },
+  })
+);
+
+interface GetObservationsArgs {
+  ids?: Array<number | string>;
+  project?: string;
+  orderBy?: string;
+  limit?: number;
+}
+
+function getObservationEpoch(observation: { [key: string]: unknown }): number {
+  const value = observation.createdAtEpoch;
+  return typeof value === 'number' ? value : 0;
+}
+
+const handleGetObservations = wrapHandler('get_observations', async (args: GetObservationsArgs) =>
+  runLegacyMemoryTool('get_observations', args, {
+    workerMode: async () => {
+      // The `ids` schema now accepts strings too (server-runtime ids are
+      // cuids), but worker mode's own REST endpoint still hard-requires
+      // integers with no coercion — validate/coerce here instead of letting
+      // a now-schema-legal string id reach the worker as an opaque 400.
+      if (Array.isArray(args.ids)) {
+        const coercedIds = args.ids.map(id => {
+          const numeric = typeof id === 'number' ? id : Number(id);
+          if (!Number.isFinite(numeric)) {
+            throw new Error(
+              `get_observations: id "${String(id)}" is not a valid worker-mode id (CLAUDE_MEM_RUNTIME is not "server", so ids must be numeric).`
+            );
+          }
+          return numeric;
+        });
+        return await callWorker('/api/observations/batch', { body: { ...args, ids: coercedIds } });
+      }
+      return await callWorker('/api/observations/batch', { body: args });
+    },
+    serverMode: async (resolution) => {
+      const projectId = resolution.projectId;
+      // Server-runtime observation ids are Postgres cuids (strings), not
+      // the SQLite integer ids worker-mode's `search` results carry —
+      // coerce whatever shape the model passes (it round-trips ids
+      // straight from a prior `search`/`timeline` call in the SAME
+      // runtime, so this only ever sees one shape per deployment in
+      // practice).
+      const ids = Array.isArray(args.ids)
+        ? args.ids.map(id => String(id).trim()).filter(id => id.length > 0)
+        : [];
+      if (ids.length === 0) {
+        throw new Error('get_observations: "ids" is required');
+      }
+      const request: ServerGetObservationsByIdsRequest = { projectId, ids };
+      const response = await resolution.client.getObservationsByIds(request);
+      // `orderBy`/`limit` are part of this tool's documented contract (and
+      // honored by the worker-mode path above) — applying them here,
+      // rather than silently dropping them, keeps the two runtimes'
+      // behavior consistent. Already fetched in hand, so this is a cheap
+      // in-memory sort/slice, not an extra round trip.
+      let observations = response.observations;
+      if (args.orderBy === 'date_desc') {
+        observations = [...observations].sort((a, b) => getObservationEpoch(b) - getObservationEpoch(a));
+      } else if (args.orderBy === 'date_asc') {
+        observations = [...observations].sort((a, b) => getObservationEpoch(a) - getObservationEpoch(b));
+      }
+      if (typeof args.limit === 'number' && args.limit >= 0) {
+        observations = observations.slice(0, args.limit);
+      }
+      return formatJsonResult({ observations });
+    },
+  })
+);
+
 interface ObservationGenerationStatusArgs {
   jobId?: string;
   job_id?: string;
@@ -489,9 +717,7 @@ NEVER fetch full details without filtering first. 10x token savings.`,
       },
       additionalProperties: true
     },
-    handler: async (args: any) => {
-      return await callWorker('/api/search', { query: args });
-    }
+    handler: async (args: any) => handleSearch(args ?? {})
   },
   {
     name: 'timeline',
@@ -499,7 +725,10 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     inputSchema: {
       type: 'object',
       properties: {
-        anchor: { type: 'number', description: 'Observation ID to center the timeline around' },
+        // Worker-mode ids are SQLite integers; server-runtime ids are
+        // Postgres cuids (strings) — accept either, same reasoning as
+        // get_observations.ids below.
+        anchor: { type: ['number', 'string'], description: 'Observation ID to center the timeline around' },
         query: { type: 'string', description: 'Query to find anchor automatically' },
         depth_before: { type: 'number', description: 'Items before anchor (default 3)' },
         depth_after: { type: 'number', description: 'Items after anchor (default 3)' },
@@ -507,9 +736,7 @@ NEVER fetch full details without filtering first. 10x token savings.`,
       },
       additionalProperties: true
     },
-    handler: async (args: any) => {
-      return await callWorker('/api/timeline', { query: args });
-    }
+    handler: async (args: any) => handleTimeline(args ?? {})
   },
   {
     name: 'get_observations',
@@ -519,16 +746,17 @@ NEVER fetch full details without filtering first. 10x token savings.`,
       properties: {
         ids: {
           type: 'array',
-          items: { type: 'number' },
+          // Worker-mode ids are SQLite integers; server-runtime ids are
+          // Postgres cuids (strings) — accept either so this schema doesn't
+          // reject the shape the active runtime actually returns from search/timeline.
+          items: { type: ['number', 'string'] },
           description: 'Array of observation IDs to fetch (required)'
         }
       },
       required: ['ids'],
       additionalProperties: true
     },
-    handler: async (args: any) => {
-      return await callWorker('/api/observations/batch', { body: args });
-    }
+    handler: async (args: any) => handleGetObservations(args ?? {})
   },
   {
     name: 'session_start_context',

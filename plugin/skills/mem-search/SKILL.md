@@ -19,6 +19,8 @@ Use when users ask about PREVIOUS sessions (not current conversation):
 
 **NEVER fetch full details without filtering first. 10x token savings.**
 
+**On `CLAUDE_MEM_RUNTIME=server` installs, omit `project`.** It's a worker-mode-only filter (a human-readable label like `basename(cwd)`); the server runtime has no such concept and is already scoped to the connected project via its own API key, so passing `project` errors instead of filtering. The examples below include it because they were written for worker-mode installs — drop it on server-runtime installs.
+
 ### Step 1: Search - Get Index with IDs
 
 Use the `search` MCP tool:
@@ -66,7 +68,7 @@ timeline(query="authentication", depth_before=3, depth_after=3, project="my-proj
 
 **Parameters:**
 
-- `anchor` (number, optional) - Observation ID to center around
+- `anchor` (number or string, optional) - Observation ID to center around (worker-mode ids are numbers; server-runtime ids are strings — pass back whatever `search` returned, unmodified)
 - `query` (string, optional) - Find anchor automatically if anchor not provided
 - `depth_before` (number, optional) - Items before anchor, default 5, max 20
 - `depth_after` (number, optional) - Items after anchor, default 5, max 20
@@ -86,7 +88,7 @@ get_observations(ids=[11131, 10942])
 
 **Parameters:**
 
-- `ids` (array of numbers, required) - Observation IDs to fetch
+- `ids` (array of numbers or strings, required) - Observation IDs to fetch (worker-mode ids are numbers; server-runtime ids are strings — pass back whatever `search`/`timeline` returned, unmodified)
 - `orderBy` (string, optional) - "date_desc" (default), "date_asc"
 - `limit` (number, optional) - Max observations to return
 - `project` (string, optional) - Project name filter

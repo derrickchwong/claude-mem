@@ -245,6 +245,227 @@ describe('server beta postgres observation storage', () => {
     })).resolves.toHaveLength(1);
   });
 
+  it('fetches observations by id, scoped to project and team, silently omitting misses and cross-scope ids', async () => {
+    const { project } = await createFixtureScope(storage);
+    const other = await createFixtureScope(storage);
+
+    const first = await storage.observations.create({
+      projectId: project.id,
+      teamId: project.teamId,
+      content: 'First batch-fetch observation'
+    });
+    const second = await storage.observations.create({
+      projectId: project.id,
+      teamId: project.teamId,
+      content: 'Second batch-fetch observation'
+    });
+    const otherProjectObservation = await storage.observations.create({
+      projectId: other.project.id,
+      teamId: other.project.teamId,
+      content: 'Different project, must not leak into the batch result'
+    });
+
+    const results = await storage.observations.getByIdsForScope({
+      ids: [first.id, second.id, otherProjectObservation.id, 'does-not-exist'],
+      projectId: project.id,
+      teamId: project.teamId
+    });
+
+    expect(results.map(o => o.id).sort()).toEqual([first.id, second.id].sort());
+  });
+
+  it('returns matches in the same order as the requested ids, not database order', async () => {
+    const { project } = await createFixtureScope(storage);
+
+    const first = await storage.observations.create({
+      projectId: project.id, teamId: project.teamId, content: 'A'
+    });
+    const second = await storage.observations.create({
+      projectId: project.id, teamId: project.teamId, content: 'B'
+    });
+    const third = await storage.observations.create({
+      projectId: project.id, teamId: project.teamId, content: 'C'
+    });
+
+    // Request in reverse-of-creation order, with a miss interleaved — the
+    // response must follow the REQUESTED order, not insertion/DB order.
+    const results = await storage.observations.getByIdsForScope({
+      ids: [third.id, 'does-not-exist', first.id, second.id],
+      projectId: project.id,
+      teamId: project.teamId
+    });
+
+    expect(results.map(o => o.id)).toEqual([third.id, first.id, second.id]);
+  });
+
+  it('returns an empty array from getByIdsForScope when given no ids, without querying', async () => {
+    const { project } = await createFixtureScope(storage);
+    const results = await storage.observations.getByIdsForScope({
+      ids: [],
+      projectId: project.id,
+      teamId: project.teamId
+    });
+    expect(results).toEqual([]);
+  });
+
+  it('builds chronological before/after context around a timeline anchor, scoped to project and team', async () => {
+    const { project } = await createFixtureScope(storage);
+    const other = await createFixtureScope(storage);
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const observation = await storage.observations.create({
+        projectId: project.id,
+        teamId: project.teamId,
+        content: `Timeline observation ${i}`
+      });
+      ids.push(observation.id);
+      // Postgres timestamp resolution + FK-free inserts can land in the same
+      // millisecond; the timeline ordering this test asserts depends on
+      // distinct created_at values, same as the app's own observation
+      // stream (spaced out by real agent activity in production).
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const otherProjectAnchor = await storage.observations.create({
+      projectId: other.project.id,
+      teamId: other.project.teamId,
+      content: 'Different project anchor'
+    });
+
+    const anchorId = ids[2];
+    const timeline = await storage.observations.timelineForScope({
+      anchorId,
+      projectId: project.id,
+      teamId: project.teamId,
+      depthBefore: 2,
+      depthAfter: 2
+    });
+
+    expect(timeline).not.toBeNull();
+    expect(timeline?.anchor.id).toBe(anchorId);
+    expect(timeline?.before.map(o => o.id)).toEqual([ids[0], ids[1]]);
+    expect(timeline?.after.map(o => o.id)).toEqual([ids[3], ids[4]]);
+
+    const crossScope = await storage.observations.timelineForScope({
+      anchorId: otherProjectAnchor.id,
+      projectId: project.id,
+      teamId: project.teamId
+    });
+    expect(crossScope).toBeNull();
+
+    const missing = await storage.observations.timelineForScope({
+      anchorId: 'does-not-exist',
+      projectId: project.id,
+      teamId: project.teamId
+    });
+    expect(missing).toBeNull();
+  });
+
+  it('respects depthBefore/depthAfter limits on the timeline window', async () => {
+    const { project } = await createFixtureScope(storage);
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const observation = await storage.observations.create({
+        projectId: project.id,
+        teamId: project.teamId,
+        content: `Bounded timeline observation ${i}`
+      });
+      ids.push(observation.id);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+
+    const timeline = await storage.observations.timelineForScope({
+      anchorId: ids[2],
+      projectId: project.id,
+      teamId: project.teamId,
+      depthBefore: 1,
+      depthAfter: 1
+    });
+
+    expect(timeline?.before.map(o => o.id)).toEqual([ids[1]]);
+    expect(timeline?.after.map(o => o.id)).toEqual([ids[3]]);
+  });
+
+  it('does not silently exclude same-timestamp siblings from the timeline window (same-transaction batch insert)', async () => {
+    const { project } = await createFixtureScope(storage);
+
+    // A single generation job persists every observation it produces inside
+    // one transaction (processGeneratedResponse.ts's withPostgresTransaction)
+    // — Postgres freezes now() for the whole transaction, so siblings from
+    // the same batch get an identical created_at. Reproduce that exactly
+    // (via a real BEGIN/COMMIT on the same client) rather than faking a
+    // timestamp, since that's the actual mechanism that triggers the bug.
+    await client.query('BEGIN');
+    const siblingIds: string[] = [];
+    for (const content of ['sibling A', 'sibling B', 'sibling C']) {
+      const observation = await storage.observations.create({
+        projectId: project.id,
+        teamId: project.teamId,
+        content
+      });
+      siblingIds.push(observation.id);
+    }
+    await client.query('COMMIT');
+
+    // A distinctly-later observation, so there's something unambiguous to
+    // find in "after" regardless of how the tied siblings sort against it.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const later = await storage.observations.create({
+      projectId: project.id,
+      teamId: project.teamId,
+      content: 'later observation'
+    });
+
+    const timeline = await storage.observations.timelineForScope({
+      anchorId: siblingIds[0],
+      projectId: project.id,
+      teamId: project.teamId,
+      depthBefore: 5,
+      depthAfter: 5
+    });
+
+    expect(timeline).not.toBeNull();
+    const contextIds = [...timeline!.before.map(o => o.id), ...timeline!.after.map(o => o.id)];
+    // Neither same-timestamp sibling is silently dropped from the window —
+    // which side of the anchor each lands on is an implementation detail
+    // (id-tiebroken, not creation-order), so this only asserts presence.
+    expect(contextIds).toContain(siblingIds[1]);
+    expect(contextIds).toContain(siblingIds[2]);
+    // The anchor never appears in its own before/after context.
+    expect(contextIds).not.toContain(siblingIds[0]);
+    // The distinctly-later observation is unambiguously placed after.
+    expect(timeline!.after.map(o => o.id)).toContain(later.id);
+  });
+
+  it('accepts a pre-fetched anchor row instead of re-fetching it by id (used by /v1/timeline when resolving from `query`)', async () => {
+    const { project } = await createFixtureScope(storage);
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const observation = await storage.observations.create({
+        projectId: project.id, teamId: project.teamId, content: `passthrough observation ${i}`
+      });
+      ids.push(observation.id);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const prefetchedAnchor = await storage.observations.getByIdForScope({
+      id: ids[2], projectId: project.id, teamId: project.teamId
+    });
+    expect(prefetchedAnchor).not.toBeNull();
+
+    const timeline = await storage.observations.timelineForScope({
+      anchorId: ids[2],
+      anchor: prefetchedAnchor!,
+      projectId: project.id,
+      teamId: project.teamId,
+      depthBefore: 2,
+      depthAfter: 2
+    });
+
+    expect(timeline).not.toBeNull();
+    expect(timeline?.anchor).toEqual(prefetchedAnchor!);
+    expect(timeline?.before.map(o => o.id)).toEqual([ids[0], ids[1]]);
+    expect(timeline?.after.map(o => o.id)).toEqual([ids[3], ids[4]]);
+  });
+
   it('scopes observation generation_key idempotency to project and team', async () => {
     const firstScope = await createFixtureScope(storage);
     const secondScope = await createFixtureScope(storage);

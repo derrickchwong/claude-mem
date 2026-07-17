@@ -200,6 +200,40 @@ export interface ServerJobStatusResponse {
   };
 }
 
+// Server-runtime backing for the legacy worker-mode MCP tool
+// `get_observations` ("Step 3: fetch full details for filtered IDs").
+export interface ServerGetObservationsByIdsRequest {
+  projectId: string;
+  ids: string[];
+}
+
+export interface ServerGetObservationsByIdsResponse {
+  observations: Array<{
+    id: string;
+    projectId: string;
+    content: string;
+    [key: string]: unknown;
+  }>;
+}
+
+// Server-runtime backing for the legacy worker-mode MCP tool `timeline`
+// ("Step 2: get context around results"). Pass `anchorId` directly, or
+// `query` to have the server resolve an anchor from the top search hit.
+export interface ServerTimelineRequest {
+  projectId: string;
+  anchorId?: string;
+  query?: string;
+  depthBefore?: number;
+  depthAfter?: number;
+  platformSource?: string | null;
+}
+
+export interface ServerTimelineResponse {
+  anchor: { id: string; projectId: string; content: string; [key: string]: unknown };
+  before: Array<{ id: string; projectId: string; content: string; [key: string]: unknown }>;
+  after: Array<{ id: string; projectId: string; content: string; [key: string]: unknown }>;
+}
+
 export class ServerClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -281,6 +315,36 @@ export class ServerClient {
     return this.request<ServerJobStatusResponse>(
       'GET',
       `/v1/jobs/${encodeURIComponent(jobId)}`,
+    );
+  }
+
+  // MCP `get_observations` server-runtime path. Calls `/v1/memories/batch`
+  // rather than looping `/v1/memories/:id` per id, so a multi-id fetch is one
+  // round trip instead of N.
+  async getObservationsByIds(
+    input: ServerGetObservationsByIdsRequest,
+  ): Promise<ServerGetObservationsByIdsResponse> {
+    return this.request<ServerGetObservationsByIdsResponse>(
+      'POST',
+      '/v1/memories/batch',
+      { projectId: input.projectId, ids: input.ids },
+    );
+  }
+
+  // MCP `timeline` server-runtime path. Calls `/v1/timeline`, which resolves
+  // an anchor from `query` server-side when `anchorId` is omitted.
+  async getTimeline(input: ServerTimelineRequest): Promise<ServerTimelineResponse> {
+    return this.request<ServerTimelineResponse>(
+      'POST',
+      '/v1/timeline',
+      {
+        projectId: input.projectId,
+        ...(input.anchorId !== undefined ? { anchorId: input.anchorId } : {}),
+        ...(input.query !== undefined ? { query: input.query } : {}),
+        ...(input.depthBefore !== undefined ? { depthBefore: input.depthBefore } : {}),
+        ...(input.depthAfter !== undefined ? { depthAfter: input.depthAfter } : {}),
+        ...(input.platformSource !== undefined ? { platformSource: normalizePlatformSourceField(input.platformSource) } : {}),
+      },
     );
   }
 
