@@ -213,15 +213,19 @@ describe('ServerClient', () => {
     });
     expect(captured[0]?.url).toBe('http://localhost:9999/v1/memories');
     expect(captured[0]?.method).toBe('POST');
-    // Write-path contract (#2684): content maps onto narrative (the FTS-indexed
-    // / trigger-precondition column) and type defaults from kind, so the row is
-    // never empty. The old payload shipped a `content` field that no column
-    // accepted, producing a frozen/empty observation.
+    // The deployed POST /v1/memories route (ServerV1PostgresRoutes,
+    // instantiated by ServerService — confirmed directly, not the other
+    // non-Postgres route implementation) requires a literal `content`
+    // field; there is no `narrative`/`type` column. A prior fix (#2684)
+    // mapped `content` onto `narrative` believing that was the deployed
+    // contract — it 400ed every real call instead ("expected string,
+    // received undefined" on `content`), confirmed live against a running
+    // server.
     const body = captured[0]?.body as Record<string, unknown>;
-    expect(body.narrative).toBe('hello');
+    expect(body.content).toBe('hello');
     expect(body.kind).toBe('manual');
-    expect(body.type).toBe('manual');
-    expect(body.content).toBeUndefined();
+    expect(body.narrative).toBeUndefined();
+    expect(body.type).toBeUndefined();
     expect(result.memory.id).toBe('o1');
   });
 
@@ -340,13 +344,13 @@ describe('ServerClient', () => {
 
   it('payload builders omit absent fields', () => {
     const client = new ServerClient({ serverBaseUrl: 'http://x', apiKey: 'k' });
-    // content → narrative, type defaults from kind (default 'manual') so a
-    // minimal observation_add still persists a searchable row (#2684).
+    // `content` stays `content` — the deployed POST /v1/memories route
+    // (ServerV1PostgresRoutes) requires that literal field name; kind
+    // defaults to 'manual' so a minimal observation_add still persists.
     expect(client.buildAddObservationPayload({ projectId: 'p', content: 'c' })).toEqual({
       projectId: 'p',
       kind: 'manual',
-      type: 'manual',
-      narrative: 'c',
+      content: 'c',
     });
     expect(client.buildSearchPayload({ projectId: 'p', query: 'q' })).toEqual({
       projectId: 'p',

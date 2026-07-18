@@ -351,22 +351,22 @@ export class ServerClient {
   buildAddObservationPayload(
     input: ServerAddObservationRequest,
   ): Record<string, unknown> {
-    // Write-path contract (#2684): /v1/memories persists a `memory_items` row
-    // whose searchable text lives in `narrative` (the FTS trigger copies it
-    // into memory_items_fts). The MCP `observation_add` surface speaks in terms
-    // of `content`; map it onto `narrative` so the row is never empty and the
-    // FTS index always has something to match. `type` is REQUIRED by
-    // CreateMemoryItemSchema; default it from `kind` so a manual insert that
-    // only supplied content still persists instead of 400-ing.
-    const content = input.content;
-    const kind = input.kind ?? 'manual';
-    const metadataTitle = typeof input.metadata?.title === 'string' ? input.metadata.title : undefined;
+    // The `#2684` comment this replaced described a `memory_items`/
+    // `narrative`/`CreateMemoryItemSchema` write-path contract that isn't
+    // what's actually deployed: `ServerV1PostgresRoutes` (instantiated by
+    // `ServerService`, confirmed directly) persists straight to the
+    // `observations` table and its `POST /v1/memories` Zod schema requires a
+    // literal `content` field — there is no `narrative`/`type` field at all.
+    // Sending `narrative` instead of `content` 400ed every `observation_add`
+    // call ("expected string, received undefined" on `content`), verified
+    // live against a real deployed server. `title` was similarly hoisted out
+    // of `metadata` for a `title` column that schema doesn't have either;
+    // dropped — it's silently stripped either way, and any caller-supplied
+    // title already round-trips through the `metadata` passthrough below.
     return {
       projectId: input.projectId,
-      kind,
-      type: kind,
-      narrative: content,
-      ...(metadataTitle ? { title: metadataTitle } : {}),
+      kind: input.kind ?? 'manual',
+      content: input.content,
       ...(input.serverSessionId !== undefined ? { serverSessionId: input.serverSessionId } : {}),
       ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
     };
