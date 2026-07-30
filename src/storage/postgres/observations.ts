@@ -185,6 +185,12 @@ export class PostgresObservationRepository {
   // `/v1/context` (query optional — SessionStart injection has no search
   // term, just "what's recent"). See plans/2026-07-13-session-start-context-
   // injection-server-mode.md.
+  //
+  // When the query is multi-word and the strict websearch pass matches
+  // nothing, a second pass retries with the same words OR'd (see
+  // buildOrFallbackFtsQuery) — ts_rank still floats the closest matches to
+  // the top, so verbose natural-language queries degrade to "best partial
+  // match" instead of an empty result set.
   async search(input: {
     projectId: string;
     teamId: string;
@@ -192,8 +198,28 @@ export class PostgresObservationRepository {
     limit?: number;
     platformSource?: string | null;
   }): Promise<PostgresObservation[]> {
-    const platformSource = normalizePlatformSourceOrNull(input.platformSource);
     const query = input.query && input.query.trim().length > 0 ? input.query : null;
+    const primary = await this.searchScopeRows(input, query);
+    if (primary.length > 0 || !query) {
+      return primary;
+    }
+    const fallbackQuery = buildOrFallbackFtsQuery(query);
+    if (!fallbackQuery) {
+      return primary;
+    }
+    return this.searchScopeRows(input, fallbackQuery);
+  }
+
+  private async searchScopeRows(
+    input: {
+      projectId: string;
+      teamId: string;
+      limit?: number;
+      platformSource?: string | null;
+    },
+    query: string | null
+  ): Promise<PostgresObservation[]> {
+    const platformSource = normalizePlatformSourceOrNull(input.platformSource);
     const result = await this.client.query<ObservationRow>(
       `
         SELECT observations.* FROM observations
@@ -438,6 +464,25 @@ export class PostgresObservationSourcesRepository {
     );
     return result.rows.map(mapObservationSourceRow);
   }
+}
+
+// Agents write verbose natural-language search queries ("Student Application
+// Details prototype Figma update"); websearch_to_tsquery ANDs bare words, so
+// a single off-vocabulary word zeroes the whole result set — 14 of 18 real
+// agent searches on a production deployment returned empty this way. This
+// builds the relaxed second-pass query: the same words OR'd, ranked by
+// ts_rank so multi-word hits still sort first. Queries that already use
+// websearch operators (quoted phrases, OR, -exclusions) express deliberate
+// intent and are never rewritten; single-word queries have nothing to relax.
+export function buildOrFallbackFtsQuery(query: string): string | null {
+  if (/["']/.test(query) || /\bOR\b/.test(query) || /(^|\s)-\S/.test(query)) {
+    return null;
+  }
+  const words = query.split(/\s+/).filter(Boolean);
+  if (words.length < 2) {
+    return null;
+  }
+  return words.join(' OR ');
 }
 
 export function buildObservationGenerationKey(input: {

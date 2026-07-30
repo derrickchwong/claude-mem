@@ -207,16 +207,28 @@ describe('server-beta Postgres platform source scoping', () => {
       platformSource: 'Cursor CLI',
     });
 
-    expect(client.calls).toHaveLength(1);
-    expect(client.calls[0].text).toContain('LEFT JOIN server_sessions');
-    expect(client.calls[0].text).toContain('server_sessions.platform_source = $5');
-    expect(client.calls[0].text).toContain('observations.server_session_id IS NULL');
-    expect(client.calls[0].text).toContain('INNER JOIN agent_events');
-    expect(client.calls[0].text).toContain('agent_events.platform_source = $5');
+    // The capturing client returns no rows, so the strict pass triggers the
+    // OR-fallback second pass — which must carry the SAME normalized
+    // platform-source scoping, not drop it.
+    expect(client.calls).toHaveLength(2);
+    for (const call of client.calls) {
+      expect(call.text).toContain('LEFT JOIN server_sessions');
+      expect(call.text).toContain('server_sessions.platform_source = $5');
+      expect(call.text).toContain('observations.server_session_id IS NULL');
+      expect(call.text).toContain('INNER JOIN agent_events');
+      expect(call.text).toContain('agent_events.platform_source = $5');
+    }
     expect(client.calls[0].values).toEqual([
       'project-1',
       'team-1',
       'auth bug',
+      7,
+      'cursor',
+    ]);
+    expect(client.calls[1].values).toEqual([
+      'project-1',
+      'team-1',
+      'auth OR bug',
       7,
       'cursor',
     ]);

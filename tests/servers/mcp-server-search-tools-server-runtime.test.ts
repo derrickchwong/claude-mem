@@ -174,6 +174,30 @@ describe('search/timeline/get_observations over real MCP stdio under CLAUDE_MEM_
     expect(result.text).toContain('beta memory entry');
   });
 
+  it('search relaxes a verbose multi-word query to OR semantics instead of returning nothing', async () => {
+    // No stored observation contains every one of these words, so the strict
+    // websearch AND pass is empty; the OR fallback still surfaces the
+    // closest match instead of the empty result agents used to get.
+    const result = await callTool('search', { query: 'delta beta memory bulletin' });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain('beta memory entry');
+  });
+
+  it('session_start_context serves the connected project in server mode (previously: dead worker path)', async () => {
+    // Schema-following callers always send `project` (worker mode requires
+    // it); server mode is key-scoped to one project, so the name filter is
+    // accepted and ignored rather than rejected.
+    const result = await callTool('session_start_context', { project: 'some/worker-mode-name' });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain('memory entry');
+  });
+
+  it('session_start_context needs no project argument at all in server mode', async () => {
+    const result = await callTool('session_start_context', {});
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain('memory entry');
+  });
+
   it('search rejects an unsupported filter (dateStart) with a clear, actionable error instead of silently ignoring it', async () => {
     const result = await callTool('search', { query: 'alpha', dateStart: '2026-01-01' });
     expect(result.isError).toBe(true);

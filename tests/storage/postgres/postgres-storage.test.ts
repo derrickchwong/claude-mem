@@ -4,6 +4,7 @@ import {
   SERVER_POSTGRES_TABLES,
   bootstrapServerPostgresSchema,
   buildObservationGenerationKey,
+  buildOrFallbackFtsQuery,
   createPostgresStorageRepositories,
   type PostgresPoolClient,
   type PostgresStorageRepositories
@@ -81,6 +82,28 @@ describe('server beta postgres schema bootstrap', () => {
     expect(schemaSql).toContain('idx_server_sessions_external_session_platform');
     expect(schemaSql).toContain('DROP INDEX IF EXISTS idx_server_sessions_content_session');
     expect(schemaSql).toContain('idx_server_sessions_content_session_platform');
+  });
+});
+
+describe('buildOrFallbackFtsQuery', () => {
+  it('ORs the words of a bare multi-word query', () => {
+    expect(buildOrFallbackFtsQuery('student application details')).toBe('student OR application OR details');
+  });
+
+  it('collapses arbitrary whitespace between words', () => {
+    expect(buildOrFallbackFtsQuery('  alpha \t beta\n gamma ')).toBe('alpha OR beta OR gamma');
+  });
+
+  it('returns null for single-word queries (nothing to relax)', () => {
+    expect(buildOrFallbackFtsQuery('deployment')).toBeNull();
+    expect(buildOrFallbackFtsQuery('  deployment  ')).toBeNull();
+  });
+
+  it('never rewrites queries that use explicit websearch operators', () => {
+    expect(buildOrFallbackFtsQuery('"student application" details')).toBeNull();
+    expect(buildOrFallbackFtsQuery('student OR application')).toBeNull();
+    expect(buildOrFallbackFtsQuery('student -application')).toBeNull();
+    expect(buildOrFallbackFtsQuery("student's application")).toBeNull();
   });
 });
 
@@ -243,6 +266,50 @@ describe('server beta postgres observation storage', () => {
       projectId: project.id,
       teamId: project.teamId
     })).resolves.toHaveLength(1);
+  });
+
+  it('falls back to OR semantics when a strict multi-word websearch query matches nothing', async () => {
+    const { project } = await createFixtureScope(storage);
+    const createObservation = (content: string) => storage.observations.create({
+      projectId: project.id,
+      teamId: project.teamId,
+      kind: 'manual',
+      content
+    });
+    const partialMatch = await createObservation('Updated the prototype layout from the Figma design tokens');
+    const unrelated = await createObservation('Batch conversion notes for the payroll pipeline');
+
+    // No stored row contains every word, so the strict AND pass is empty;
+    // the OR fallback surfaces the closest partial match instead.
+    const results = await storage.observations.search({
+      projectId: project.id,
+      teamId: project.teamId,
+      query: 'student application details prototype figma update'
+    });
+
+    expect(results.map(item => item.id)).toContain(partialMatch.id);
+    expect(results.map(item => item.id)).not.toContain(unrelated.id);
+    expect(results[0]?.id).toBe(partialMatch.id);
+  });
+
+  it('does not relax queries that use explicit websearch operators', async () => {
+    const { project } = await createFixtureScope(storage);
+    await storage.observations.create({
+      projectId: project.id,
+      teamId: project.teamId,
+      kind: 'manual',
+      content: 'Updated the prototype layout from the Figma design tokens'
+    });
+
+    // The quoted phrase matches nothing and expresses deliberate operator
+    // intent — no OR fallback, the empty result stands.
+    const results = await storage.observations.search({
+      projectId: project.id,
+      teamId: project.teamId,
+      query: '"student application" prototype'
+    });
+
+    expect(results).toHaveLength(0);
   });
 
   it('fetches observations by id, scoped to project and team, silently omitting misses and cross-scope ids', async () => {

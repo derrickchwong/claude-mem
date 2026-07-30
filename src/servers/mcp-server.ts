@@ -598,30 +598,45 @@ function normalizeProjectsArg(args: SessionStartContextArgs): string[] {
   return [];
 }
 
-async function handleSessionStartContext(
-  args: SessionStartContextArgs,
-): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
-  const projects = normalizeProjectsArg(args);
-  if (projects.length === 0) {
-    return {
-      content: [{
-        type: 'text' as const,
-        text: 'session_start_context: "project" or "projects" is required',
-      }],
-      isError: true,
-    };
-  }
-
-  return callWorker('/api/context/inject', {
-    query: {
-      projects: projects.join(','),
-      ...(args.platformSource !== undefined ? { platformSource: normalizeMcpPlatformSource(args.platformSource) } : {}),
-      ...(args.full !== undefined ? { full: args.full } : {}),
-      ...(args.colors !== undefined ? { colors: args.colors } : {}),
-    },
-    text: true,
-  });
-}
+const handleSessionStartContext = wrapHandler(
+  'session_start_context',
+  async (args: SessionStartContextArgs) =>
+    // Unlike search/timeline/get_observations, `project` is REQUIRED by this
+    // tool's worker-mode contract, so a schema-following caller always sends
+    // it. Server mode is hard-scoped to a single project by its API key, so
+    // the worker-mode project-name filter is accepted and ignored (the shared
+    // guard sees `project: undefined`) rather than rejected — rejecting would
+    // make every schema-following first call fail in server mode.
+    runLegacyMemoryTool('session_start_context', { project: undefined }, {
+      workerMode: async () => {
+        const projects = normalizeProjectsArg(args);
+        if (projects.length === 0) {
+          throw new Error('session_start_context: "project" or "projects" is required');
+        }
+        return callWorker('/api/context/inject', {
+          query: {
+            projects: projects.join(','),
+            ...(args.platformSource !== undefined ? { platformSource: normalizeMcpPlatformSource(args.platformSource) } : {}),
+            ...(args.full !== undefined ? { full: args.full } : {}),
+            ...(args.colors !== undefined ? { colors: args.colors } : {}),
+          },
+          text: true,
+        });
+      },
+      // Server mode has no renderer for worker-mode's injected-text format;
+      // `/v1/context` returns the same recency-ordered observations the
+      // SessionStart hook injection reads, as JSON. `full`/`colors` are
+      // worker-mode formatting flags with no server equivalent and are
+      // ignored.
+      serverMode: async (resolution) => {
+        const response = await resolution.client.contextObservations({
+          projectId: resolution.projectId,
+          platformSource: normalizeMcpPlatformSource(args.platformSource ?? null),
+        });
+        return formatJsonResult(response);
+      },
+    }),
+);
 
 const handleObservationGenerationStatus = wrapHandler('observation_generation_status', async (args: ObservationGenerationStatusArgs) => {
   const ctx = requireServerForObservationTool('observation_generation_status');
@@ -760,7 +775,7 @@ NEVER fetch full details without filtering first. 10x token savings.`,
   },
   {
     name: 'session_start_context',
-    description: 'Render the exact worker-mode SessionStart context for a project. Calls /api/context/inject and returns the same text hooks inject at startup. Params: project OR projects, platformSource, full, colors.',
+    description: 'SessionStart context on demand. Worker mode: calls /api/context/inject and returns the same text hooks inject at startup (project OR projects required). Server mode (CLAUDE_MEM_RUNTIME=server): returns the connected project\'s recent observations as JSON — the same data SessionStart injection reads; project/projects/full/colors are ignored. Params: project OR projects (worker mode), platformSource.',
     inputSchema: {
       type: 'object',
       properties: {
