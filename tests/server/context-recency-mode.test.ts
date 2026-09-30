@@ -106,6 +106,47 @@ describe('POST /v1/context recency mode (no query)', () => {
     expect(body.context).toContain('first observation');
   });
 
+  it('prefixes every memory in the context string with its id and UTC creation date, in observation order', async () => {
+    const titled = await storage.observations.create({
+      projectId, teamId, kind: 'manual',
+      content: 'Titled memory\nbody under the title', metadata: { title: 'Titled memory' },
+    });
+    const r = await post('/v1/context', { projectId });
+    expect(r.status).toBe(200);
+    const body = await r.json() as {
+      observations: Array<{ id: string; content: string; createdAtEpoch: number }>;
+      context: string;
+    };
+    const day = (epoch: number) => new Date(epoch).toISOString().slice(0, 10);
+    const [first, ...rest] = body.observations;
+    expect(first.id).toBe(titled.id);
+    expect(body.context).toBe([
+      `# Project memory: ${body.observations.length} memories, newest first`,
+      `[memory:${titled.id} · ${day(first.createdAtEpoch)}] Titled memory\nbody under the title`,
+      ...rest.map(o => `[memory:${o.id} · ${day(o.createdAtEpoch)}] ${o.content}`),
+    ].join('\n\n'));
+    // The observations array itself is unchanged: raw content, no header.
+    expect(first.content).toBe('Titled memory\nbody under the title');
+  });
+
+  it('labels a query-ranked context block without claiming newest-first order', async () => {
+    const r = await post('/v1/context', { projectId, query: 'routing' });
+    expect(r.status).toBe(200);
+    const body = await r.json() as { observations: Array<{ id: string; createdAtEpoch: number }>; context: string };
+    const [only] = body.observations;
+    const day = new Date(only.createdAtEpoch).toISOString().slice(0, 10);
+    expect(body.context).toBe(
+      `# Project memory: 1 memories\n\n[memory:${only.id} · ${day}] second observation about routing`,
+    );
+  });
+
+  it('returns an empty context string, with no header, when the project has no memories', async () => {
+    const empty = await storage.projects.create({ teamId, name: 'Empty' });
+    const r = await post('/v1/context', { projectId: empty.id });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ observations: [], context: '' });
+  });
+
   it('respects `limit` in recency mode', async () => {
     const r = await post('/v1/context', { projectId, limit: 2 });
     expect(r.status).toBe(200);

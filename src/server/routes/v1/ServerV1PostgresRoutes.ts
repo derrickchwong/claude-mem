@@ -34,6 +34,7 @@ import { PostgresServerSessionsRepository } from '../../../storage/postgres/serv
 import { IngestEventsService, type EnqueueOutcome } from '../../services/IngestEventsService.js';
 import { EndSessionService } from '../../services/EndSessionService.js';
 import { normalizePlatformSource, normalizePlatformSourceOrNull } from '../../../shared/platform-source.js';
+import { formatContextBlock } from '../../context-block.js';
 
 const SOURCE_ADAPTER_DEFAULT = 'api';
 
@@ -73,6 +74,15 @@ interface BatchPreValidationFailure {
 const EVENT_QUERY_SCHEMA = z.object({
   generate: z.union([z.literal('true'), z.literal('false')]).optional(),
   wait: z.union([z.literal('true'), z.literal('false')]).optional(),
+});
+
+// Query strings arrive as strings; coerce the numeric params, but keep them
+// strict integers so `limit=1.5` or `offset=abc` is a 400, not a silent clamp.
+const MEMORY_LIST_QUERY_SCHEMA = z.object({
+  projectId: z.string().min(1),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+  order: z.enum(['created_desc', 'created_asc']).default('created_desc'),
 });
 
 // `?wait=true` polls the outbox row until it reaches a terminal status
@@ -946,6 +956,50 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       },
     ));
 
+    // GET /v1/memories — page through a project's observations, newest first
+    // by default. Backs a memory browser that has no search term; same
+    // serialisation, auth and scoping as /v1/memories/batch. Ordered by
+    // (created_at, id) so rows sharing a timestamp never straddle a page.
+    app.get('/v1/memories', readAuth, this.asyncHandler(async (req, res) => {
+      const parsed = MEMORY_LIST_QUERY_SCHEMA.safeParse(req.query);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'ValidationError', issues: parsed.error.issues });
+        return;
+      }
+      const query = parsed.data;
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      if (!this.ensureProjectAllowed(req, res, query.projectId)) return;
+      let page;
+      try {
+        const repo = new PostgresObservationRepository(this.options.pool);
+        page = await repo.listPageForScope({
+          projectId: query.projectId,
+          teamId,
+          limit: query.limit,
+          offset: query.offset,
+          order: query.order,
+        });
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        logger.warn('SYSTEM', 'observation.list failed', { requestId: req.requestId ?? null }, err);
+        this.handleDbError(err, res, 'observation.list');
+        return;
+      }
+      await this.auditWrite(req, 'observation.read', null, query.projectId, {
+        mode: 'list',
+        limit: query.limit,
+        offset: query.offset,
+        order: query.order,
+        resultCount: page.observations.length,
+        observationIds: page.observations.map(o => o.id),
+      });
+      res.status(200).json({
+        observations: page.observations.map(serializeObservation),
+        total: page.total,
+      });
+    }));
+
     // Phase 8 — full-text search over generated observations using the GIN
     // tsvector index. Results are ranked by ts_rank desc, then updated_at desc.
     // The MCP `observation_search` tool calls this endpoint via HTTP so the
@@ -1043,10 +1097,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           this.handleDbError(err, res, 'observation.context');
           return;
         }
-        const context = results
-          .map(observation => observation.content)
-          .filter(text => typeof text === 'string' && text.length > 0)
-          .join('\n\n');
+        // search() falls back to `ORDER BY created_at DESC` exactly when the
+        // query is absent or blank; with a query the rows are rank-ordered.
+        const recencyMode = !(body.query && body.query.trim().length > 0);
+        const context = formatContextBlock(results, recencyMode ? 'newest-first' : 'ranked');
         await this.auditWrite(req, 'observation.read', null, body.projectId, {
           mode: 'context',
           query: body.query,
