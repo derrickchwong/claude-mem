@@ -179,6 +179,36 @@ export class PostgresObservationRepository {
     return result.rows.map(mapObservationRow);
   }
 
+  // Offset paging for GET /v1/memories. (created_at, id) is a total order, so
+  // consecutive pages neither repeat nor skip a row that shares a timestamp.
+  async listPageForScope(input: {
+    projectId: string;
+    teamId: string;
+    limit: number;
+    offset: number;
+    order: 'created_desc' | 'created_asc';
+  }): Promise<{ observations: PostgresObservation[]; total: number }> {
+    const direction = input.order === 'created_asc' ? 'ASC' : 'DESC';
+    const rows = await this.client.query<ObservationRow>(
+      `
+        SELECT * FROM observations
+        WHERE project_id = $1 AND team_id = $2
+        ORDER BY created_at ${direction}, id ${direction}
+        LIMIT $3 OFFSET $4
+      `,
+      [input.projectId, input.teamId, input.limit, input.offset]
+    );
+    const count = await queryOne<{ total: string }>(
+      this.client,
+      'SELECT count(*)::text AS total FROM observations WHERE project_id = $1 AND team_id = $2',
+      [input.projectId, input.teamId]
+    );
+    return {
+      observations: rows.rows.map(mapObservationRow),
+      total: Number(count?.total ?? 0),
+    };
+  }
+
   // `query` is optional: when omitted (or empty), the FTS filter/ranking is
   // skipped entirely and results fall back to recency order. This backs both
   // `/v1/search` (query always required by that route's own validation) and

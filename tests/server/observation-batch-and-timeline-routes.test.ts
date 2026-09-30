@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// POST /v1/memories/batch and POST /v1/timeline — the server-runtime REST
+// POST /v1/memories/batch, GET /v1/memories and POST /v1/timeline — the server-runtime REST
 // endpoints that back the legacy worker-mode MCP tools `get_observations`
 // and `timeline`. Before this change, those tools always called a local
 // per-container worker over HTTP that the plugin deliberately never starts
@@ -23,7 +23,7 @@ import { newApiKey, createIsolatedSchema, poolForSchema, dropSchema } from '../s
 
 const testDatabaseUrl = process.env.CLAUDE_MEM_TEST_POSTGRES_URL;
 
-describe('POST /v1/memories/batch and POST /v1/timeline', () => {
+describe('POST /v1/memories/batch, GET /v1/memories and POST /v1/timeline', () => {
   if (!testDatabaseUrl) {
     it.skip('requires CLAUDE_MEM_TEST_POSTGRES_URL', () => {});
     return;
@@ -142,6 +142,122 @@ describe('POST /v1/memories/batch and POST /v1/timeline', () => {
       expect(missing.status).toBe(400);
       const empty = await post('/v1/memories/batch', { projectId, ids: [] });
       expect(empty.status).toBe(400);
+    });
+  });
+
+  describe('GET /v1/memories', () => {
+    type ListBody = { observations: Array<Record<string, unknown> & { id: string }>; total: number };
+    const list = (query: string, key: string = readKey) =>
+      fetch(url(`/v1/memories?${query}`), { headers: authHeaders(key) });
+
+    it('pages newest first by default, with the total across all pages', async () => {
+      const first = await list(`projectId=${projectId}&limit=2`);
+      expect(first.status).toBe(200);
+      const firstBody = await first.json() as ListBody;
+      expect(firstBody.total).toBe(5);
+      expect(firstBody.observations.map(o => o.id)).toEqual([ids[4], ids[3]]);
+
+      const second = await list(`projectId=${projectId}&limit=2&offset=2`);
+      expect((await second.json() as ListBody).observations.map(o => o.id)).toEqual([ids[2], ids[1]]);
+
+      const last = await list(`projectId=${projectId}&limit=2&offset=4`);
+      const lastBody = await last.json() as ListBody;
+      expect(lastBody.observations.map(o => o.id)).toEqual([ids[0]]);
+      expect(lastBody.total).toBe(5);
+
+      const past = await list(`projectId=${projectId}&offset=10`);
+      const pastBody = await past.json() as ListBody;
+      expect(pastBody.observations).toEqual([]);
+      expect(pastBody.total).toBe(5);
+    });
+
+    it('defaults to 50 rows when limit is omitted', async () => {
+      for (let i = 0; i < 50; i++) {
+        await storage.observations.create({ projectId, teamId, kind: 'manual', content: `bulk ${i}` });
+      }
+      const r = await list(`projectId=${projectId}`);
+      expect(r.status).toBe(200);
+      const body = await r.json() as ListBody;
+      expect(body.observations).toHaveLength(50);
+      expect(body.total).toBe(55);
+    });
+
+    it('orders oldest first with order=created_asc', async () => {
+      const r = await list(`projectId=${projectId}&order=created_asc&limit=3&offset=1`);
+      expect(r.status).toBe(200);
+      expect((await r.json() as ListBody).observations.map(o => o.id)).toEqual([ids[1], ids[2], ids[3]]);
+    });
+
+    it('breaks created_at ties by id so pages never repeat or skip a row', async () => {
+      await client.query('UPDATE observations SET created_at = $1 WHERE project_id = $2', [new Date('2026-01-01T00:00:00Z'), projectId]);
+      const sorted = [...ids].sort();
+      const pages: string[] = [];
+      for (let offset = 0; offset < 5; offset += 2) {
+        const r = await list(`projectId=${projectId}&order=created_asc&limit=2&offset=${offset}`);
+        pages.push(...(await r.json() as ListBody).observations.map(o => o.id));
+      }
+      expect(pages).toEqual(sorted);
+      const desc = await list(`projectId=${projectId}&limit=5`);
+      expect((await desc.json() as ListBody).observations.map(o => o.id)).toEqual([...sorted].reverse());
+    });
+
+    it('serialises each observation exactly as /v1/memories/batch does', async () => {
+      const listed = await list(`projectId=${projectId}&limit=1`);
+      const [fromList] = (await listed.json() as ListBody).observations;
+      const batch = await post('/v1/memories/batch', { projectId, ids: [ids[4]] });
+      const [fromBatch] = (await batch.json() as ListBody).observations;
+      expect(fromList).toEqual(fromBatch);
+      expect(Object.keys(fromList).sort()).toEqual([
+        'content', 'createdAtEpoch', 'id', 'kind', 'metadata', 'projectId', 'serverSessionId', 'teamId', 'updatedAtEpoch',
+      ]);
+    });
+
+    it('400s on out-of-range or malformed paging params', async () => {
+      for (const query of [
+        `projectId=${projectId}&limit=0`,
+        `projectId=${projectId}&limit=201`,
+        `projectId=${projectId}&limit=1.5`,
+        `projectId=${projectId}&limit=abc`,
+        `projectId=${projectId}&offset=-1`,
+        `projectId=${projectId}&order=updated_desc`,
+        'limit=10',
+      ]) {
+        const r = await list(query);
+        expect({ query, status: r.status }).toEqual({ query, status: 400 });
+      }
+      const edge = await list(`projectId=${projectId}&limit=200`);
+      expect(edge.status).toBe(200);
+      const one = await list(`projectId=${projectId}&limit=1`);
+      expect((await one.json() as ListBody).observations).toHaveLength(1);
+    });
+
+    it('403s when a project-scoped key lists a different project', async () => {
+      const r = await list(`projectId=${otherProjectId}`);
+      expect(r.status).toBe(403);
+      const reverse = await list(`projectId=${projectId}`, otherProjectReadKey);
+      expect(reverse.status).toBe(403);
+    });
+
+    it('does not leak observations from another project in the same team', async () => {
+      const r = await list(`projectId=${otherProjectId}`, otherProjectReadKey);
+      expect(r.status).toBe(200);
+      expect(await r.json()).toEqual({ observations: [], total: 0 });
+    });
+
+    it('returns nothing for a project that belongs to another team', async () => {
+      const otherTeam = await storage.teams.create({ name: 'other team' });
+      const k = newApiKey();
+      await storage.auth.createApiKey({
+        keyHash: k.hash, teamId: otherTeam.id, projectId: null, actorId: 't3', scopes: ['memories:read'],
+      });
+      const r = await list(`projectId=${projectId}`, k.raw);
+      expect(r.status).toBe(200);
+      expect(await r.json()).toEqual({ observations: [], total: 0 });
+    });
+
+    it('401s without an API key', async () => {
+      const r = await fetch(url(`/v1/memories?projectId=${projectId}`));
+      expect(r.status).toBe(401);
     });
   });
 
